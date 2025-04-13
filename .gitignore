@@ -1,0 +1,69 @@
+# macOS system files
+.DS_Store
+
+# VSCode or JetBrains IDEs
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+
+# Local configs and credentials
+constants.py
+
+# Tinderbotz data (already present)
+data/
+
+# Browser automation persistent context (Playwright/Chromium)
+browser_data/
+browser_data/**
+
+# Playwright user profile
+playwright/
+playwright/**
+
+# Cache, sessions, and logs
+*.log
+*.sqlite
+*.db
+*.pid
+*.swp
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+*.orig
+
+
+# Ignore Playwright and Chrome profiles
+browser_data/
+chrome_profile/
+
+# Ignore scraped profiles
+data/
+
+# Ignore macOS clutter
+.DS_Store
+
+# Ignore logs and error screenshots
+*.log
+error_*.png
+login_page.png
+phone_button_not_found.png
+
+# Ignore compiled Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore build artifacts
+build/
+dist/
+*.egg-info/
