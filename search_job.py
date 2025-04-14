@@ -1,17 +1,17 @@
-import asyncio
+import argparse
 import json
-import logging
-import random
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
-import shortuuid
-from tinderbotz.helpers.constants_helper import LocationConfig
-import re
-from sqlalchemy import create_engine, select, and_
-from sqlalchemy.orm import sessionmaker
-from db.models import Profile
+import os
+from typing import Optional, Dict, List, Union
+import face_recognition
+import numpy as np
+from PIL import Image
+import requests
+from io import BytesIO
 from db import get_db
+from db.models import Profile
+from sqlalchemy import and_, or_
+import logging
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(
@@ -21,256 +21,351 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database configuration
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/daterDB"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 class SearchJob:
-    """Represents a search job request"""
-    def __init__(self, name: str, age: int, location: Dict[str, str], photos: List[str]):
+    def __init__(self, name: str, age: int, city: str, country: str, image_path: str,
+                 age_min: Optional[int] = None, age_max: Optional[int] = None,
+                 city_only: bool = False, name_contains: Optional[str] = None):
         self.name = name
         self.age = age
-        self.location = LocationConfig(city=location["city"], country=location["country"])
-        self.photos = photos
+        self.city = city
+        self.country = country
+        self.image_path = image_path
+        self.age_min = age_min
+        self.age_max = age_max
+        self.city_only = city_only
+        self.name_contains = name_contains
+        self.face_embedding = None
 
     @classmethod
     def from_json(cls, data: Dict) -> 'SearchJob':
-        """Create a SearchJob from JSON data"""
-        return cls(
-            name=data["name"],
-            age=data["age"],
-            location=data["location"],
-            photos=data["photos"]
-        )
+        """Create SearchJob from JSON data, supporting both flat and nested formats"""
+        try:
+            # Handle nested location format
+            if 'location' in data:
+                location = data['location']
+                city = location.get('city')
+                country = location.get('country')
+            else:
+                city = data.get('city')
+                country = data.get('country')
 
-def load_profiles(location: LocationConfig) -> List[Profile]:
-    """Load all profiles for a specific location from database"""
-    profiles = []
-    db = SessionLocal()
-    
+            # Validate required fields
+            if not all([data.get('name'), data.get('age'), city, country, data.get('image')]):
+                missing = [k for k, v in {
+                    'name': data.get('name'),
+                    'age': data.get('age'),
+                    'city': city,
+                    'country': country,
+                    'image': data.get('image')
+                }.items() if not v]
+                raise ValueError(f"Missing required fields: {', '.join(missing)}")
+
+            return cls(
+                name=data['name'],
+                age=data['age'],
+                city=city,
+                country=country,
+                image_path=data['image'],
+                age_min=data.get('age_min'),
+                age_max=data.get('age_max'),
+                city_only=data.get('city_only', False),
+                name_contains=data.get('name_contains')
+            )
+        except Exception as e:
+            logger.error(f"❌ Error parsing JSON data: {str(e)}")
+            raise
+
+def extract_face_embedding(image_path: str) -> Optional[List[float]]:
+    """Extract face embedding from an image file"""
     try:
-        # Query profiles by scraped_from location
-        stmt = select(Profile).where(
-            Profile.scraped_from_city == location.city,
-            Profile.scraped_from_country == location.country
-        )
-        profiles = db.execute(stmt).scalars().all()
+        # Load image
+        if image_path.startswith(('http://', 'https://')):
+            logger.info(f"🌐 Downloading image from URL: {image_path}")
+            response = requests.get(image_path)
+            image = Image.open(BytesIO(response.content))
+        else:
+            logger.info(f"📂 Loading local image: {image_path}")
+            image = Image.open(image_path)
         
-        logger.info(f"✅ Loaded {len(profiles)} profiles from database for {location.city}, {location.country}")
+        # Log image details
+        logger.info(f"📊 Image format: {image.format}, size: {image.size}, mode: {image.mode}")
         
-    except Exception as e:
-        logger.error(f"❌ Error loading profiles from database: {str(e)}")
+        # Convert to RGB
+        if image.mode != 'RGB':
+            logger.info(f"🔄 Converting image from {image.mode} to RGB")
+            image = image.convert('RGB')
         
-    finally:
-        db.close()
+        image_array = np.array(image)
         
-    return profiles
-
-def run_fuzzy_match(search_job: SearchJob, profiles: List[Profile]) -> Optional[Dict]:
-    """Run fuzzy matching on profiles that have already been location-validated"""
-    if not profiles:
-        return None
-    
-    # Filter profiles by name (case-insensitive) and age (±1 year)
-    valid_matches = [
-        profile for profile in profiles
-        if profile.name.lower() == search_job.name.lower() and
-        abs(profile.age - search_job.age) <= 1
-    ]
-    
-    if not valid_matches:
-        logger.info(f"❌ No matches found for {search_job.name} (age: {search_job.age})")
-        return None
-    
-    # Sort by name similarity and age difference
-    def match_score(profile: Profile) -> Tuple[int, int]:
-        name_diff = abs(len(profile.name) - len(search_job.name))
-        age_diff = abs(profile.age - search_job.age)
-        return (name_diff, age_diff)
-    
-    # Get the best match
-    best_match = min(valid_matches, key=match_score)
-    
-    # Calculate confidence score (higher is better)
-    name_similarity = 1 - (abs(len(best_match.name) - len(search_job.name)) / max(len(best_match.name), len(search_job.name)))
-    age_similarity = 1 - (abs(best_match.age - search_job.age) / max(best_match.age, search_job.age))
-    confidence = (name_similarity + age_similarity) / 2
-    
-    return {
-        "match": {
-            "name": best_match.name,
-            "age": best_match.age,
-            "profile_location": best_match.location,
-            "confidence": confidence
-        },
-        "scraped_from": {
-            "city": best_match.scraped_from_city,
-            "country": best_match.scraped_from_country
-        },
-        "metadata": {
-            "bio": best_match.bio,
-            "job": best_match.job_title,
-            "education": best_match.education,
-            "photos": best_match.photos
-        }
-    }
-
-async def process_search_job(search_job: SearchJob) -> Optional[Dict]:
-    """Process a search job and return the best match"""
-    try:
-        logger.info(f"🔍 Processing search job for {search_job.name} in {search_job.location.city}, {search_job.location.country}")
-        
-        # Load profiles for the specified location
-        profiles = load_profiles(search_job.location)
-        if not profiles:
-            logger.warning(f"⚠️ No profiles found for {search_job.location.city}, {search_job.location.country}")
+        # Detect faces
+        face_locations = face_recognition.face_locations(image_array)
+        if not face_locations:
+            logger.warning("⚠️ No face detected in the input image. Possible reasons:")
+            logger.warning("  • Image resolution too low")
+            logger.warning("  • No clear face in the image")
+            logger.warning("  • Face is too small or too large")
             return None
             
-        # Run fuzzy matching
-        result = run_fuzzy_match(search_job, profiles)
-        if result:
-            logger.info(f"✅ Found match: {result['match']['name']} (confidence: {result['match']['confidence']:.2f})")
-        else:
-            logger.info("❌ No matches found")
-        
-        return result
+        # Extract embedding
+        face_encoding = face_recognition.face_encodings(image_array, [face_locations[0]])[0]
+        logger.info("✅ Successfully extracted face embedding")
+        return face_encoding.tolist()
         
     except Exception as e:
-        logger.error(f"❌ Error processing search job: {str(e)}")
+        logger.error(f"❌ Error extracting face embedding: {str(e)}")
         return None
 
-async def main():
-    """Main function to process a search job from JSON input"""
+def extract_face_embedding_from_photos(photos: List[str]) -> Optional[List[float]]:
+    """Try to extract face embedding from multiple photos"""
+    for i, photo_url in enumerate(photos):
+        logger.info(f"🖼️ Trying photo {i+1}/{len(photos)}: {photo_url}")
+        embedding = extract_face_embedding(photo_url)
+        if embedding:
+            return embedding
+    logger.warning("⚠️ No faces detected in any of the profile photos")
+    return None
+
+def find_matching_profiles(search_job: SearchJob) -> List[Dict]:
+    """Find profiles matching the search criteria"""
     try:
-        # Load search job from JSON file
-        with open("search_job.json", 'r') as f:
-            search_job_data = json.load(f)
+        db = next(get_db())
         
-        search_job = SearchJob.from_json(search_job_data)
+        # Build base query
+        query = db.query(Profile).filter(
+            and_(
+                Profile.scraped_from_city == search_job.city,
+                Profile.scraped_from_country == search_job.country
+            )
+        )
         
-        # Process the search job
-        result = await process_search_job(search_job)
+        # Add name filter
+        if search_job.name_contains:
+            query = query.filter(Profile.name.ilike(f"%{search_job.name_contains}%"))
+        else:
+            query = query.filter(Profile.name.ilike(f"%{search_job.name}%"))
         
-        # Print or return the result
-        if result:
-            print("\n🔍 Search Results:")
-            print(f"Name: {result['match']['name']}")
-            print(f"Age: {result['match']['age']}")
-            print(f"Profile Location: {result['match']['profile_location']}")
-            print(f"Scraped From: {result['scraped_from']['city']}, {result['scraped_from']['country']}")
-            print(f"Confidence: {result['match']['confidence']:.2f}")
+        # Add age range filter
+        if search_job.age_min is not None:
+            query = query.filter(Profile.age >= search_job.age_min)
+        if search_job.age_max is not None:
+            query = query.filter(Profile.age <= search_job.age_max)
+        
+        # Add city-only filter
+        if search_job.city_only:
+            query = query.filter(Profile.location.ilike(f"%{search_job.city}%"))
+        
+        profiles = query.all()
+        
+        if not profiles:
+            logger.info(f"❌ No profiles found in {search_job.city}, {search_job.country}")
+            return []
             
-            print("\n📝 Additional Info:")
-            print(f"Bio: {format_field(result['metadata']['bio'])}")
-            print(f"Job: {format_field(result['metadata']['job'])}")
-            print(f"Education: {format_field(result['metadata']['education'])}")
+        logger.info(f"✅ Found {len(profiles)} profiles matching location and name criteria")
             
-            # Display all photos
-            photos = result['metadata']['photos']
-            print(f"\n🖼️ Photos ({len(photos) if photos else 0}):")
-            if photos:
-                for url in photos:
-                    print(f"  • {url}")
-            else:
-                print("  Not Provided")
+        # Extract face embedding from search image
+        search_embedding = extract_face_embedding(search_job.image_path)
+        if not search_embedding:
+            logger.warning(f"⚠️ Could not extract face embedding from: {search_job.image_path}")
+            return []
+            
+        # Calculate similarity scores
+        matches = []
+        for profile in profiles:
+            if not profile.face_embedding:
+                # Try to extract face embedding from profile photos
+                profile.face_embedding = extract_face_embedding_from_photos(profile.photos)
+                if not profile.face_embedding:
+                    continue
                 
+            # Calculate face similarity
+            face_similarity = face_recognition.face_distance(
+                [np.array(profile.face_embedding)],
+                np.array(search_embedding)
+            )[0]
+            
+            # Convert distance to similarity score (0-1)
+            similarity_score = 1 - face_similarity
+            
+            # Only include matches with reasonable similarity
+            if similarity_score > 0.6:
+                matches.append({
+                    "profile": profile,
+                    "similarity_score": similarity_score
+                })
+        
+        if not matches:
+            logger.info("❌ No profiles found with face similarity > 0.6")
+            return []
+            
+        # Sort by similarity score
+        matches.sort(key=lambda x: x["similarity_score"], reverse=True)
+        logger.info(f"✅ Found {len(matches)} profiles with face similarity > 0.6")
+        return matches
+        
+    except Exception as e:
+        logger.error(f"❌ Error finding matching profiles: {str(e)}")
+        return []
+    finally:
+        db.close()
+
+def display_match_result(match: Dict) -> None:
+    """Display detailed match result"""
+    profile = match["profile"]
+    similarity = match["similarity_score"]
+    
+    print("\n" + "="*50)
+    print(f"✅ Match found (Similarity: {similarity:.2f})")
+    print("="*50)
+    
+    print(f"\n👤 Name: {profile.name}")
+    print(f"🎂 Age: {profile.age}")
+    print(f"🌍 Location: {profile.location}")
+    print(f"📝 Bio: {profile.bio}")
+    print(f"💼 Job: {profile.job_title}")
+    print(f"🎓 Education: {profile.education}")
+    print(f"📅 Scraped At: {profile.scraped_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔍 Source: {profile.source}")
+    
+    print(f"\n🖼️ Photos ({len(profile.photos)}):")
+    for url in profile.photos[:3]:  # Show first 3 photos
+        print(f"  • {url}")
+    
+    print("\n🎯 Passions:")
+    for passion in profile.passions:
+        print(f"  • {passion}")
+    
+    print("="*50)
+
+def save_matches_to_json(matches: List[Dict], output_path: str) -> None:
+    """Save matches to JSON file"""
+    try:
+        results = []
+        for match in matches[:3]:  # Save top 3 matches
+            profile = match["profile"]
+            results.append({
+                "name": profile.name,
+                "age": profile.age,
+                "city": profile.scraped_from_city,
+                "country": profile.scraped_from_country,
+                "job": profile.job_title,
+                "education": profile.education,
+                "photos": profile.photos,
+                "passions": profile.passions,
+                "similarity_score": match["similarity_score"],
+                "scraped_at": profile.scraped_at.isoformat(),
+                "source": profile.source
+            })
+        
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"✅ Saved {len(results)} matches to {output_path}")
+    except Exception as e:
+        logger.error(f"❌ Error saving matches to JSON: {str(e)}")
+
+def interactive_mode() -> SearchJob:
+    """Run in interactive CLI mode"""
+    print("\n🔍 Interactive Search Mode")
+    print("="*50)
+    
+    name = input("Enter name: ").strip()
+    age = int(input("Enter age: ").strip())
+    city = input("Enter city: ").strip()
+    country = input("Enter country: ").strip()
+    image_path = input("Enter image path or URL: ").strip()
+    
+    print("\nOptional filters (press Enter to skip):")
+    age_min = input("Minimum age: ").strip()
+    age_max = input("Maximum age: ").strip()
+    city_only = input("Match city only? (y/n): ").strip().lower() == 'y'
+    name_contains = input("Name contains (partial match): ").strip()
+    
+    return SearchJob(
+        name=name,
+        age=age,
+        city=city,
+        country=country,
+        image_path=image_path,
+        age_min=int(age_min) if age_min else None,
+        age_max=int(age_max) if age_max else None,
+        city_only=city_only,
+        name_contains=name_contains if name_contains else None
+    )
+
+def main():
+    try:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(
+            description="Search for matching profiles using face recognition",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  # Interactive mode
+  python search_job.py -i
+  
+  # CLI mode with filters
+  python search_job.py --name Shweta --age 25 --city Wayanad --country India --image shweta.webp --age-min 20 --age-max 30 --city-only
+  
+  # JSON mode with output
+  python search_job.py --output results.json
+            """
+        )
+        parser.add_argument("--name", help="Name to search for")
+        parser.add_argument("--age", type=int, help="Age to search for")
+        parser.add_argument("--city", help="City to search in")
+        parser.add_argument("--country", help="Country to search in")
+        parser.add_argument("--image", help="Path to image file")
+        parser.add_argument("--age-min", type=int, help="Minimum age filter")
+        parser.add_argument("--age-max", type=int, help="Maximum age filter")
+        parser.add_argument("--city-only", action="store_true", help="Match city only")
+        parser.add_argument("--name-contains", help="Partial name match")
+        parser.add_argument("--interactive", "-i", action="store_true", help="Run in interactive mode")
+        parser.add_argument("--output", "--save", help="Save results to JSON file")
+        
+        args = parser.parse_args()
+        
+        # If interactive mode is requested, use it regardless of other arguments
+        if args.interactive:
+            logger.info("💬 Starting interactive mode")
+            search_job = interactive_mode()
+        # Otherwise, check for CLI arguments
+        elif any(vars(args).values()):
+            logger.info("📝 Using CLI arguments")
+            search_job = SearchJob(
+                name=args.name,
+                age=args.age,
+                city=args.city,
+                country=args.country,
+                image_path=args.image,
+                age_min=args.age_min,
+                age_max=args.age_max,
+                city_only=args.city_only,
+                name_contains=args.name_contains
+            )
+        # If no arguments, check for JSON file
+        elif os.path.exists("search_job.json"):
+            logger.info("📄 Found search_job.json, using JSON mode")
+            with open("search_job.json", 'r') as f:
+                search_job = SearchJob.from_json(json.load(f))
+        # If nothing else, start interactive mode
+        else:
+            logger.info("💬 No arguments provided, starting interactive mode")
+            search_job = interactive_mode()
+        
+        # Find and display matches
+        matches = find_matching_profiles(search_job)
+        if matches:
+            for match in matches[:3]:  # Show top 3 matches
+                display_match_result(match)
+            
+            # Save results if requested
+            if args.output:
+                save_matches_to_json(matches, args.output)
         else:
             print("\n❌ No matches found")
             
     except Exception as e:
         logger.error(f"❌ Error in main: {str(e)}")
-
-def format_field(value: Any, default: str = "Not Provided") -> str:
-    """Format a field value, handling None and empty values"""
-    if value is None or value == "":
-        return default
-    return str(value)
-
-def format_timestamp(timestamp: datetime) -> str:
-    """Format a datetime object into a readable string"""
-    return timestamp.strftime("%Y-%m-%d %H:%M:%S")
-
-def format_photos(photos: List[str], max_display: int = 2) -> str:
-    """Format photo URLs with a maximum display limit and better formatting"""
-    if not photos:
-        return "Not Provided"
-    
-    # Format each URL with proper indentation and bullet points
-    photo_lines = [f"  • {url}" for url in photos[:max_display]]
-    
-    # Add ellipsis if there are more photos
-    if len(photos) > max_display:
-        photo_lines.append(f"  • ... and {len(photos) - max_display} more photos")
-    
-    return "\n".join(photo_lines)
-
-def format_passions(passions: List[str]) -> str:
-    """Format passions as a comma-separated list"""
-    if not passions:
-        return "Not Provided"
-    return ", ".join(passions)
-
-def display_match_result(profile: Profile, confidence: float) -> None:
-    """Display a detailed match result from the database"""
-    print("\n" + "="*50)
-    print(f"✅ Match retrieved from PostgreSQL (ID: {profile.id})")
-    print("="*50)
-    
-    # Basic Info
-    print(f"\n👤 Name: {format_field(profile.name)}")
-    print(f"🎂 Age: {format_field(profile.age)}")
-    
-    # Location Info
-    print(f"\n🌍 Scraped From: {format_field(profile.scraped_from_city)}, {format_field(profile.scraped_from_country)}")
-    print(f"📍 Profile Location: {format_field(profile.location)}")
-    
-    # Profile Details
-    print(f"\n📝 Bio: {format_field(profile.bio)}")
-    print(f"💼 Job: {format_field(profile.job_title)}")
-    print(f"🎓 Education: {format_field(profile.education)}")
-    
-    # Photos
-    print(f"\n🖼️ Photos ({len(profile.photos) if profile.photos else 0}):")
-    print(format_photos(profile.photos))
-    
-    # Passions
-    print(f"\n🎯 Passions: {format_passions(profile.passions)}")
-    
-    # Metadata
-    print(f"\n📅 Scraped At: {format_timestamp(profile.created_at)}")
-    print(f"Confidence Score: {confidence:.2f}")
-    print("="*50 + "\n")
-
-def search_profiles(location_city: str, location_country: str) -> List[Dict[str, Any]]:
-    """Search for profiles in a specific location"""
-    try:
-        db = next(get_db())
-        profiles = db.query(Profile).filter(
-            and_(
-                Profile.scraped_from_city == location_city,
-                Profile.scraped_from_country == location_country
-            )
-        ).all()
-        
-        # Display each match with detailed information
-        for profile in profiles:
-            # For now, using a random confidence score
-            # This would be replaced with actual matching logic
-            confidence = random.uniform(0.5, 1.0)
-            display_match_result(profile, confidence)
-        
-        return [profile.to_dict() for profile in profiles]
-        
-    except Exception as e:
-        logger.error(f"❌ Error searching profiles: {str(e)}")
-        return []
-        
-    finally:
-        db.close()
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    # Example usage
-    results = search_profiles("New York", "USA")
-    logger.info(f"Found {len(results)} profiles") 
+    main() 
