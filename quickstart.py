@@ -6,17 +6,26 @@ import asyncio
 import json
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tinderbotz.session import Session
-from tinderbotz.helpers.constants_helper import DEFAULT_LOCATION
+from tinderbotz.helpers.constants_helper import DEFAULT_LOCATION, LocationConfig
 import os
 from playwright.async_api import TimeoutError, Error as PlaywrightError
 import re
 import time
-import shortuuid  # Add this import at the top
+import shortuuid
+from typing import Dict, Optional, List
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from db.models import Profile
+import face_recognition
+import requests
+from PIL import Image
+from io import BytesIO
+import numpy as np
 
-# Set up detailed logging
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -24,9 +33,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create data directory if it doesn't exist
-DATA_DIR = Path("data/scraped_profiles")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Database configuration
+DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/daterDB"
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Location tracking file
+LOCATIONS_FILE = Path("indexed_locations.json")
+
+def normalize_location_name(name: str) -> str:
+    """Normalize location name for directory use"""
+    return re.sub(r'[^\w]', '', name.lower())
+
+def get_profile_dir(location: LocationConfig) -> Path:
+    """Get the profile directory for a location"""
+    country_dir = normalize_location_name(location.country)
+    city_dir = normalize_location_name(location.city)
+    profile_dir = Path("data/scraped_profiles") / country_dir / city_dir
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return profile_dir
+
+def get_location_key(location: LocationConfig) -> str:
+    """Get the combined city|country key for indexing"""
+    return f"{location.city}|{location.country}"
+
+def get_user_location() -> LocationConfig:
+    """Prompt user for location input"""
+    print("\n📍 Location Configuration")
+    print("Press Enter to use default values")
+    
+    city = input("Enter city: ").strip()
+    country = input("Enter country: ").strip()
+    
+    if not city and not country:
+        logger.info("Using default location configuration")
+        return DEFAULT_LOCATION
+        
+    return LocationConfig(city=city or DEFAULT_LOCATION.city, 
+                         country=country or DEFAULT_LOCATION.country)
+
+def load_indexed_locations():
+    """Load the indexed locations from file"""
+    try:
+        if LOCATIONS_FILE.exists():
+            with open(LOCATIONS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"❌ Error loading indexed locations: {str(e)}")
+        return {}
+
+def save_indexed_locations(locations):
+    """Save the indexed locations to file"""
+    try:
+        with open(LOCATIONS_FILE, 'w') as f:
+            json.dump(locations, f, indent=2)
+    except Exception as e:
+        logger.error(f"❌ Error saving indexed locations: {str(e)}")
+
+def location_recently_indexed(location: LocationConfig) -> bool:
+    """Check if a location was indexed in the last 7 days"""
+    locations = load_indexed_locations()
+    location_key = get_location_key(location)
+    if location_key in locations:
+        last_indexed = datetime.fromisoformat(locations[location_key])
+        if datetime.now() - last_indexed < timedelta(days=7):
+            logger.info(f"✅ Location {location.city}, {location.country} was indexed recently ({last_indexed})")
+            return True
+    return False
+
+def update_location_index(location: LocationConfig):
+    """Update the last indexed timestamp for a location"""
+    locations = load_indexed_locations()
+    location_key = get_location_key(location)
+    locations[location_key] = datetime.now().isoformat()
+    save_indexed_locations(locations)
+    logger.info(f"✅ Updated index timestamp for {location.city}, {location.country}")
 
 seen_photos = set()  # Global set to track all seen photo URLs
 
@@ -45,28 +127,36 @@ async def save_page_html(page, filename="tinder_profile.html"):
     except Exception as e:
         logger.error(f"❌ Failed to save HTML: {str(e)}")
 
-async def log_profile(profile_data):
-    """Log profile data to a JSON file with the new naming convention"""
+async def log_profile(profile_data: Dict, location: LocationConfig) -> None:
+    """Save profile data to PostgreSQL database"""
     try:
-        # Skip profiles with missing name or age
-        if not profile_data.get('name') or not profile_data.get('age'):
-            logger.warning("⚠️ Skipping profile with missing name or age")
-            return
-            
-        # Generate sanitized filename
-        sanitized_name = sanitize_filename(profile_data['name'])
-        short_uuid = shortuuid.uuid()[:8]  # Get first 8 chars of UUID
-        filename = f"profile_{sanitized_name}_{profile_data['age']}_{short_uuid}.json"
-        filepath = DATA_DIR / filename
+        # Create database session
+        db = SessionLocal()
         
-        # Save the profile data
-        with open(filepath, 'w') as f:
-            json.dump(profile_data, f, indent=2)
+        try:
+            # Create Profile model instance
+            profile = Profile.from_dict(profile_data)
             
-        logger.info(f"✅ Logged profile data to {filename}")
-        
+            # Set scraped_from fields directly
+            profile.scraped_from_city = location.city
+            profile.scraped_from_country = location.country
+            
+            # Add to database
+            db.add(profile)
+            db.commit()
+            
+            logger.info(f"✅ Saved profile to database: {profile.name}")
+            
+        except Exception as e:
+            db.rollback()
+            logger.error(f"❌ Failed to save profile to database: {str(e)}")
+            raise
+            
+        finally:
+            db.close()
+            
     except Exception as e:
-        logger.error(f"❌ Failed to log profile data: {str(e)}")
+        logger.error(f"❌ Error in log_profile: {str(e)}")
 
 async def wait_for_element(page, selector, timeout=10000):
     """Wait for an element to be visible and return it"""
@@ -127,7 +217,41 @@ async def extract_photo_url(element) -> str:
         logger.error(f"❌ Error extracting photo URL: {str(e)}")
     return None
 
-async def scrape_profile_data(page):
+def extract_face_embedding(photo_url: str) -> Optional[List[float]]:
+    """Extract face embedding from a photo URL"""
+    try:
+        # Download image
+        logger.info(f"🖼️ Checking photo URL: {photo_url}")
+        response = requests.get(photo_url)
+        if response.status_code != 200:
+            logger.warning(f"⚠️ Failed to load image from: {photo_url}")
+            return None
+            
+        # Convert to RGB
+        image = Image.open(BytesIO(response.content))
+        image = image.convert('RGB')
+        logger.info(f"🎨 Image mode after conversion: {image.mode}")
+        image_array = np.array(image)
+        
+        # Detect faces
+        face_locations = face_recognition.face_locations(image_array)
+        if not face_locations:
+            logger.warning(f"⚠️ No face detected in: {photo_url}")
+            return None
+            
+        # Extract embedding from first face
+        try:
+            face_encoding = face_recognition.face_encodings(image_array, [face_locations[0]])[0]
+            return face_encoding.tolist()
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to extract encoding from: {photo_url} - {str(e)}")
+            return None
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Error processing photo {photo_url}: {str(e)}")
+        return None
+
+async def scrape_profile_data(page, location: LocationConfig):
     """Scrape profile data using the new selectors"""
     try:
         logger.info("🔄 Starting profile data scraping...")
@@ -288,9 +412,9 @@ async def scrape_profile_data(page):
             distance_element = await page.query_selector('div:has-text("kilometres away")')
             distance = await distance_element.text_content() if distance_element else None
             
-            # Get location
-            location_element = await page.query_selector('div[itemprop="homeLocation"]')
-            location = await location_element.text_content() if location_element else None
+            # Get profile location (not to be confused with scraped_from location)
+            profile_location_element = await page.query_selector('div[itemprop="homeLocation"]')
+            profile_location = await profile_location_element.text_content() if profile_location_element else None
             
             # Get job
             job_element = await page.query_selector('div[itemprop="jobTitle"]')
@@ -318,7 +442,7 @@ async def scrape_profile_data(page):
                 "bio": bio,
                 "looking_for": looking_for,
                 "distance": distance,
-                "location": location,
+                "location": profile_location,  # Profile's own location
                 "job": job,
                 "education": education,
                 "gender": gender,
@@ -328,9 +452,24 @@ async def scrape_profile_data(page):
                 "source": "Tinder"
             }
             
-            # Save profile data with new naming convention
-            await log_profile(profile_data)
-            logger.info(f"✅ Successfully scraped all profile data")
+            # After collecting photos, extract face embedding
+            if profile_data["photos"]:
+                logger.info(f"📸 Attempting face embedding extraction from {len(profile_data['photos'])} photo(s) for {profile_data['name']}")
+                
+                # Try each photo until we get a valid embedding
+                for photo_url in profile_data["photos"]:
+                    embedding = extract_face_embedding(photo_url)
+                    if embedding is not None:
+                        profile_data["face_embedding"] = embedding
+                        logger.info(f"✅ Successfully extracted face embedding for {profile_data['name']}")
+                        break
+                        
+                if "face_embedding" not in profile_data:
+                    logger.warning(f"⚠️ No valid face embedding found for: {profile_data['name']}")
+            
+            # Save profile data in PRD-compliant format
+            await log_profile(profile_data, location)
+            logger.info(f"✅ Successfully scraped and normalized profile data")
             return profile_data
             
         except Exception as e:
@@ -373,6 +512,15 @@ async def perform_swipe(page, action: str):
 async def main():
     logger.info("🚀 Starting Tinder scraper...")
     
+    # Get user location input
+    custom_location = get_user_location()
+    logger.info(f"📍 Using location: {custom_location.city}, {custom_location.country}")
+    
+    # Check if location needs indexing
+    if location_recently_indexed(custom_location):
+        logger.info(f"⏭️ Skipping {custom_location.city}, {custom_location.country} - already indexed recently")
+        return
+    
     # Initialize session with persistent context
     user_data_dir = os.path.expanduser('~/Library/Application Support/Playwright/PersistentContext')
     os.makedirs(user_data_dir, exist_ok=True)
@@ -385,9 +533,9 @@ async def main():
             user_data_dir=user_data_dir
         )
         
-        # Set location using the centralized config
-        latitude, longitude = DEFAULT_LOCATION.get_coordinates()
-        logger.info(f"📍 Setting location to {DEFAULT_LOCATION.city}, {DEFAULT_LOCATION.country} ({latitude}, {longitude})")
+        # Set location using the custom location
+        latitude, longitude = custom_location.get_coordinates()
+        logger.info(f"📍 Setting location to {custom_location.city}, {custom_location.country} ({latitude}, {longitude})")
         await session.set_custom_location(latitude, longitude)
         
         logger.info("🌐 Navigating to Tinder...")
@@ -406,7 +554,7 @@ async def main():
                 await session.page.wait_for_selector('div[role="img"][aria-label^="Profile Photo"]', timeout=10000)
                 
                 # Scrape profile data
-                profile_data = await scrape_profile_data(session.page)
+                profile_data = await scrape_profile_data(session.page, custom_location)
                 if profile_data:
                     logger.info(f"✅ Scraped profile: {profile_data['name']}")
                     
@@ -419,6 +567,8 @@ async def main():
                     
                 else:
                     logger.error("❌ Failed to scrape profile data")
+                    # Still perform a swipe to avoid getting stuck
+                    await perform_swipe(session.page, random.choice(["like", "dislike"]))
                 
             except Exception as e:
                 logger.error(f"❌ Error getting profile: {str(e)}")
@@ -445,6 +595,9 @@ async def main():
                 await session.playwright.stop()
             except Exception as e:
                 logger.error(f"❌ Error stopping playwright: {str(e)}")
+        
+        # Update location index after successful scraping
+        update_location_index(custom_location)
         logger.info("✅ Script finished. All profile data has been logged.")
 
 if __name__ == "__main__":

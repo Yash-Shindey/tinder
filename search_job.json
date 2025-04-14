@@ -1,0 +1,9 @@
+{
+"name": "Jini",
+"age": 21,
+"location": {
+    "city": "Hyderabad",
+    "country": "India"
+  },
+  "photos": "malk.webp"
+}

@@ -1,0 +1,122 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+
+
+This is my Product Requirements Document 
+
+
+This project is supposed to be doing only the Tinder Webscraping part, So focus only on Tinder Webscraping, but ensure it is compliant to the document i sent u always, I am using JSON now,but will move to PostGres now. But Ensure code is written in such a way, that it is easily integratable with the future steps expected as in the Product Requirements Document I just gave u 
+
+
+📝 Product Requirements Document: Dating App Indexer (Technical Work Trial)
+📌 Overview
+This technical work trial involves building a prototype dating app indexer capable of performing fuzzy search matching on profiles from platforms like Tinder and Hinge. 
+The indexer will receive a structured “search job” request containing a name, age, location, and images containing the person’s face, then determine if a match exists in the indexed dataset. 
+If the location hasn’t yet been indexed, the system must dynamically deploy a scraper (or AI agent) to collect data by interacting with the app in that region.
+The prototype should demonstrate both web and mobile scraping capabilities, smart data matching, and basic bot evasion mechanisms.
+
+🧠 Goals & Success Criteria
+🎯 Goals
+	•	Build a cost-effective prototype that can:
+	•	Receive and process search jobs.
+	•	Perform fuzzy matching on indexed dating profiles.
+	•	Index new geographic regions on demand for Tinder and Hinge.
+	•	Store structured profile data including images.
+	•	Deploy scraping bots that can operate both on web and mobile (via Android emulator/LdPlayer). You may be able to bypass emulator use by opting to reverse engineer the APIs. Evaluate both options.
+	•	Handle bot detection mechanisms (CAPTCHAs, rate limits, etc.)
+
+
+
+
+
+✅ Success Criteria
+A local or hosted service that:
+Accepts a search job via API or CLI.
+Returns results with a confidence score based on facial similarity + fuzzy text matching.
+Can demonstrate new location indexing for both Tinder and Hinge.
+Includes minimal bot evasion for both apps (e.g., CAPTCHA solving, header spoofing, emulator setup).
+Documentation for local setup, architecture, and scraping strategy.
+Basic way to visualize the data being indexed for a location /results for a search query.
+
+
+
+🔍 Search Job Input Schema
+Each search job will contain the following fields:
+{
+  "name": "Emily R.",
+  "age": 27,
+  "location": "Bondi Beach, Sydney",
+  "photos": ["img1.jpg", "img2.jpg", "img3.jpg"]
+}
+
+🧩 Core Functional Requirements
+1. Fuzzy Profile Matcher
+	•	Accepts name, age, and photos.
+	•	Compares against the indexed profile data using:
+	•	Fuzzy name/age matching 
+	•	Face embedding matching (or alternative method)
+	•	Returns top N probable matches with confidence scores.
+
+
+2. Location-Aware Index Check
+	•	Before any scraping, check if the location has been indexed within the last 7 days.
+	•	If yes, proceed directly to search.
+	•	If not, trigger a scraping job to collect fresh data for the region.
+
+
+3. Scraper Deployment Engine
+	•	Scraper should:
+	•	Log in to Tinder and/or Hinge using test account.
+	•	Set the location to target region (use GPS spoofing in emulator or API).
+	•	Swipe or scroll through profiles.
+	•	Save metadata: name, age, location, photos, bios.
+	•	Must support:
+	•	Mobile scraping via emulator (e.g., LDPlayer + ADB scripting or mitmproxy/API sniffing).
+	•	Web scraping (for platforms with desktop clients like Hinge).
+	•	Bypass bot detection: CAPTCHA-solving tools, proxy rotation, fingerprint spoofing.
+
+
+4. Profile Data Store
+	•	Store structured user profiles with:
+	•	uuid, name, age, location, bio, photos (urls or hashes), scraped_at. Any other profile data.
+	•	Use a local database (PostgreSQL) 
+5. Face Comparison Engine
+	•	Up to you on how to best implement this. The focus is on the ability to scrape profiles. Quality of face comparison engine is not necessary
+
+🔧 Technologies & Tools (Suggested by ChatGPT)
+Area
+Stack / Tool Suggestions
+Face Matching
+face_recognition, dlib, InsightFace, OpenCV
+Scraping (Mobile)
+LDPlayer, ADB, mitmproxy, Appium, Frida
+Scraping (Web)
+Puppeteer, Playwright, Selenium, undetected-chromedriver
+Bot Evasion
+CapMonster, 2Captcha, rotating proxies, header spoofing
+
+
+🔨 Work Trial Deliverables
+Deliverable
+Description
+✅ Working Scraper for Tinder
+Mobile or web version, indexes user profiles from a given location
+✅ Working Scraper for Hinge
+Same as above, supports indexing via search jobs. Can use emulator or reverse engineered API
+✅ Search Job Intake Endpoint/Script
+CLI or HTTP API that receives search job input
+✅ Face Matching Demo 
+Matches search job photos to scraped profiles, returns similarity/confidence scores
+✅ Storage Layer
+Basic local database for profiles and photos
+✅ Documentation
+Setup instructions, architecture diagram, scraping strategy, known blockers, next steps
+
+
+
+
+

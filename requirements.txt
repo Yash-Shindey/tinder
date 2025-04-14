@@ -1,6 +1,10 @@
-playwright>=1.42.0
+playwright==1.42.0
 Pillow==10.3.0
 deepface
 opencv-python
 numpy
+geopy==2.4.1
+shortuuid==1.0.13
+sqlalchemy==2.0.27
+psycopg[binary]==3.1.18
 
